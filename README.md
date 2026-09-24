@@ -1,45 +1,104 @@
-# nothing — launch code
+# nothing launch code
 
-[nothingvault.com](https://nothingvault.com) is a launchpad for [pump.fun](https://pump.fun) coins. This repository is the part of the site that builds the launch transaction a creator signs, and checks it before it is sent. It is published so anyone (wallets, security teams, users) can see exactly what a creator is asked to sign.
+[nothingvault.com](https://nothingvault.com/) is a launchpad for [pump.fun](https://pump.fun/) coins.
 
-## What one launch does
+This repository contains the code responsible for building and verifying the transaction a creator signs when launching through nothing.
 
-Every launch is **one Solana transaction**, signed by the creator's own wallet. It contains only pump.fun's official programs:
+It is public so creators, wallets, security researchers, and users can independently inspect the launch process and verify exactly what a creator is asked to sign.
 
-1. **Create the coin** on pump.fun (`create_v2`). The creator's wallet is the coin's creator.
-2. **The creator's first buy** (`buy`), paid by the creator's wallet, for the amount the creator typed in.
-3. **Set the creator-fee split** with pump.fun's official fee-sharing program (`create_fee_sharing_config`, then `update_fee_shares`), which locks it permanently:
-   - **70%** of the coin's creator fees go to the **nothing vault**, which pays out to holders of the nothing coin.
-   - **30%** go to the platform as its fee for running the site.
+## What happens during a launch
 
-Nothing else is in the transaction. The site never holds the creator's SOL or coins: the creator's wallet pays for the launch and receives the coins from the first buy directly.
+Every launch is completed in a single Solana transaction signed by the creator's own wallet.
 
-Because the split is set in the same transaction that creates the coin, the coin never exists without it, and nobody (including the site) can change it afterwards. Anyone can verify the split of any coin on-chain in pump.fun's fee-sharing account for that coin.
+The transaction uses pump.fun's official programs to perform three actions:
 
-## Signing order
+**1. Create the coin**
+The coin is created through pump.fun using `create_v2`. The connected wallet is recorded as the creator.
 
-The creator's wallet always signs first. The site then adds one more signature: the new coin's address key (the mint), which pump.fun requires when a coin is created. Before adding it, the site checks that the signed transaction is exactly the one it prepared (see `submitLaunchTx` in `src/chain.js`): paid by the creator's wallet, signed by it, and with every instruction unchanged. Wallet-added safety checks (Lighthouse) and priority-fee changes are allowed; anything else is refused and nothing is sent.
+**2. Complete the creator's first buy**
+The creator's first buy, for the amount they enter, is paid directly from their wallet, and the purchased tokens are sent directly to that wallet.
 
-## Lookup tables
+**3. Configure the creator-fee split**
+The transaction uses pump.fun's fee-sharing program through `create_fee_sharing_config` and `update_fee_shares`.
 
-A launch plus first buy plus the fee split is too large for one plain Solana transaction, so it uses address lookup tables:
+Creator fees are split:
 
-- one shared table with the accounts every launch uses (pump.fun's programs and global accounts);
-- one small table per launch with that coin's own accounts. The site's wallet pays its small deposit and closes it a few minutes later to get the deposit back (`retireTable`).
+* 70% to the nothing vault, which is used for payouts to holders of nothing.
+* 30% to the platform.
 
-The site waits until the per-launch table is finalized before handing the transaction to the wallet, so wallets can simulate it.
+The site does not take custody of the creator's SOL or purchased tokens.
 
-## Files
+Because the fee split is configured in the same transaction that creates the coin, the coin never exists without it. Once set, pump.fun locks the split: it cannot be changed afterwards by anyone, including the site.
 
-- `src/chain.js` — builds the launch transaction (`buildLaunchTx`), checks and sends the signed one (`submitLaunchTx`), and the other Solana calls the site makes (reading coins, collecting fees into the vault, paying holders).
-- `src/wallet.js` — the browser code that connects the wallet and asks it to sign.
-- `test/launch.test.js` — tests: the launch fits in one transaction with room for wallet checks, the wallet signs first, the creator is the launching wallet, the 70/30 split is in the same transaction, and a changed transaction is refused.
+The resulting configuration can be independently verified on-chain through pump.fun's fee-sharing account for the coin.
 
-Run the tests with `npm install` then `npm test`. No keys or network are needed.
+## Transaction verification
 
-## Not included
+The creator's wallet signs the transaction first.
 
-Server secrets (wallet keys, API keys) are never in code: they are set as environment variables on the server. The rest of the site (pages, database and admin tools) is not published.
+The site then adds the signature required for the new coin's mint address.
+
+Before the transaction is submitted, `submitLaunchTx` in `src/chain.js` verifies that the signed transaction still matches the launch transaction that was prepared.
+
+The verification checks that:
+
+* The creator's wallet is the transaction payer.
+* The creator signed the transaction.
+* The launch instructions have not been changed.
+* No unexpected instructions were added.
+
+Supported wallet security instructions, including Lighthouse checks, are allowed. Priority-fee adjustments are also allowed.
+
+Any other modification causes the transaction to be rejected before submission.
+
+## Address lookup tables
+
+The full launch transaction contains more accounts than can fit in a standard Solana transaction without address lookup tables.
+
+The launch process uses:
+
+* One shared lookup table for accounts used across launches.
+* One temporary lookup table for accounts specific to the coin being launched.
+
+The temporary table is finalized before the transaction is sent to the creator's wallet so compatible wallets can simulate and inspect the transaction before signing.
+
+A few minutes after the launch, the temporary table is closed through `retireTable`.
+
+## Code to review
+
+`src/chain.js`
+Contains the core Solana transaction logic, including:
+
+* `buildLaunchTx` for building launch transactions.
+* `submitLaunchTx` for verifying and submitting signed transactions.
+* Supporting Solana calls used by the platform.
+
+`src/wallet.js`
+Contains the browser-side wallet connection and transaction-signing flow.
+
+`test/launch.test.js`
+Contains automated tests covering the launch process, including:
+
+* The launch fits inside one transaction.
+* The creator's wallet signs first.
+* The connected wallet is recorded as the creator.
+* The 70/30 creator-fee split is included in the launch transaction.
+* Modified launch transactions are rejected.
+
+## Run the tests
+
+```bash
+npm install
+npm test
+```
+
+No wallet keys or live network connection are required to run the test suite.
+
+## Repository scope
+
+This repository contains the code relevant to building, signing, verifying, and submitting nothing launch transactions.
+
+It is published so the launch process can be independently reviewed and verified.
 
 ## License
 
