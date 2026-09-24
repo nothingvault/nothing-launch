@@ -1,0 +1,15 @@
+{
+  "name": "nothing-launch",
+  "version": "1.0.0",
+  "description": "How nothingvault.com builds and checks every pump.fun launch.",
+  "license": "MIT",
+  "scripts": { "test": "node --test test/launch.test.js" },
+  "dependencies": {
+    "@pump-fun/pump-sdk": "2.0.0",
+    "@solana/spl-token": "^0.4.13",
+    "@solana/web3.js": "^1.98.0",
+    "bn.js": "^5.2.1",
+    "bs58": "^6.0.0",
+    "tweetnacl": "^1.0.3"
+  }
+}
