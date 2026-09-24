@@ -10,7 +10,7 @@ It is public so creators, wallets, security researchers, and users can independe
 
 Every launch is completed in a single Solana transaction signed by the creator's own wallet.
 
-The transaction uses pump.fun's official programs to perform three actions:
+The transaction performs four actions:
 
 **1. Create the coin**
 The coin is created through pump.fun using `create_v2`. The connected wallet is recorded as the creator.
@@ -25,6 +25,9 @@ Creator fees are split:
 
 * 70% to the nothing vault, which is used for payouts to holders of nothing.
 * 30% to the platform.
+
+**4. Repay the launch setup**
+The creator pays back the small setup cost the site puts down for the launch's temporary lookup table (see below): the table's deposit plus the network fees to create and close it, about 0.004 SOL in total. This is the only payment to the site in the transaction, and the amount is shown in the wallet before signing.
 
 The site does not take custody of the creator's SOL or purchased tokens.
 
@@ -62,7 +65,7 @@ The launch process uses:
 
 The temporary table is finalized before the transaction is sent to the creator's wallet so compatible wallets can simulate and inspect the transaction before signing.
 
-A few minutes after the launch, the temporary table is closed through `retireTable`.
+A few minutes after the launch, the temporary table is closed through `retireTables`, and its deposit returns to the site wallet that put it down.
 
 ## Code to review
 
@@ -83,6 +86,7 @@ Contains automated tests covering the launch process, including:
 * The creator's wallet signs first.
 * The connected wallet is recorded as the creator.
 * The 70/30 creator-fee split is included in the launch transaction.
+* The only payment to the site is the setup repayment, for the exact setup cost.
 * Modified launch transactions are rejected.
 
 ## Run the tests
