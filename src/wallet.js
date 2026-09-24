@@ -8,15 +8,12 @@ function providers() {
   const list = [];
   const add = (id, name, p, url) => { if (p && !list.some(x => x.provider === p)) list.push({ id, name, provider: p, url }); };
   add('phantom', 'Phantom', w.phantom && w.phantom.solana && w.phantom.solana.isPhantom ? w.phantom.solana : null);
-  add('solflare', 'Solflare', w.solflare && w.solflare.isSolflare ? w.solflare : null);
-  add('backpack', 'Backpack', w.backpack && (w.backpack.solana || w.backpack) && (w.backpack.solana || w.backpack).connect ? (w.backpack.solana || w.backpack) : null);
-  if (w.solana && w.solana.connect) add('solana', w.solana.isPhantom ? 'Phantom' : 'Browser wallet', w.solana);
+  // Phantom only for now. Solflare and Backpack are switched off until each has been tested.
+  if (!list.length && w.solana && w.solana.connect && w.solana.isPhantom && !w.solana.isSolflare && !w.solana.isBackpack) add('solana', 'Phantom', w.solana);
   return list;
 }
 const INSTALL = [
-  { id: 'phantom', name: 'Phantom', url: 'https://phantom.com/download' },
-  { id: 'solflare', name: 'Solflare', url: 'https://solflare.com/download' },
-  { id: 'backpack', name: 'Backpack', url: 'https://backpack.app/download' }
+  { id: 'phantom', name: 'Phantom', url: 'https://phantom.com/download' }
 ];
 
 let active = null;

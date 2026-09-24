@@ -4,7 +4,7 @@
 'use strict';
 const {
   Connection, Keypair, PublicKey, SystemProgram, Transaction, TransactionInstruction,
-  ComputeBudgetProgram, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, AddressLookupTableProgram
+  ComputeBudgetProgram, LAMPORTS_PER_SOL, VersionedTransaction, TransactionMessage, AddressLookupTableProgram, AddressLookupTableAccount
 } = require('@solana/web3.js');
 const BN = require('bn.js');
 const bs58m = require('bs58');
@@ -267,13 +267,15 @@ function createChain(config, opts = {}) {
   // fee-split account, the buyer's coin account...). Without it, the launch (create + first buy + locking the split,
   // all in one approval) would be too big for one Solana transaction once Phantom adds its safety checks.
   // The site's wallet pays the table's deposit (about 0.004 SOL) and gets it back a few minutes later (retireTable).
-  async function coinTable(addresses) {
+  async function coinTable(addresses, record) {
     const house = wallets.house;
     let lastErr;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const slot = await connection.getSlot('finalized');
         const [create, address] = AddressLookupTableProgram.createLookupTable({ authority: house.publicKey, payer: house.publicKey, recentSlot: slot });
+        // Written down BEFORE it's sent, so its deposit is always collected later, even if this request is cut off.
+        if (record) await record(address.toBase58());
         const tx = await freshTx(house.publicKey);
         tx.add(...priorityIxs(30000), create, AddressLookupTableProgram.extendLookupTable({
           lookupTable: address, authority: house.publicKey, payer: house.publicKey, addresses: addresses.map(a => new PublicKey(a))
@@ -302,6 +304,15 @@ function createChain(config, opts = {}) {
       } catch (e) { if (out(e)) throw e; lastErr = e; await new Promise(r => setTimeout(r, 1200)); }
     }
     throw lastErr;
+  }
+
+  // What one launch's own table costs the site wallet: the table's deposit plus the network fees of the three
+  // small transactions that make, switch off and close it. The person launching pays this back in the launch.
+  let rentCache = {};
+  async function setupCost(addressCount) {
+    const bytes = 56 + 32 * addressCount;
+    if (!rentCache[bytes]) rentCache[bytes] = await connection.getMinimumBalanceForRentExemption(bytes);
+    return rentCache[bytes] + feeLamports(1, 30000) + 2 * feeLamports(1, 10000) + 5000;
   }
 
   // The accounts that are the same in every launch: everything the launch touches except the person
@@ -472,7 +483,7 @@ function createChain(config, opts = {}) {
     // itself. (If the creator isn't the wallet that buys first, pump.fun and trading sites like Axiom mark the
     // coin "Offchain".) The same transaction also locks the 70/30 split for good, signed by that wallet, so the
     // split is locked the instant the coin exists: there's no moment where it isn't.
-    async buildLaunchTx({ wallet, name, symbol, uri, devBuyLamports, useReserved, split, dryRun }) {
+    async buildLaunchTx({ wallet, name, symbol, uri, devBuyLamports, useReserved, split, dryRun, recordTable }) {
       const P = pump();
       const user = new PublicKey(wallet);
       if (useReserved && !reserved) throw userErr('The nothing coin address is not set up.');
@@ -489,7 +500,10 @@ function createChain(config, opts = {}) {
       ];
       // Always pay pump.fun's main fee account (any of its listed ones is accepted), so the accounts
       // used are the same every time and all fit in the lookup table.
-      const makeIxs = async (m, u, g) => {
+      // Last instruction: the person pays back the site for this launch's own table (amount filled in below).
+      const repay = (u, lamports) => SystemProgram.transfer({ fromPubkey: u, toPubkey: wallets.house.publicKey, lamports });
+      const makeIxs = async (m, u, g) => [...await launchIxs(m, u, g), repay(u, 1)];
+      const launchIxs = async (m, u, g) => {
         if (devBuyLamports > 0) {
           const solAmount = new BN(devBuyLamports);
           const amount = hooks.buyAmount({ global: g.global, feeConfig: g.feeConfig, solAmount });
@@ -521,11 +535,19 @@ function createChain(config, opts = {}) {
       const programs = new Set([...priority, ...core].map(ix => ix.programId.toBase58()));
       const own = [...new Set([...priority, ...core].flatMap(ix => ix.keys.filter(k => !k.isSigner).map(k => k.pubkey.toBase58())))]
         .filter(a => perLaunch.has(a) && !programs.has(a) && a !== user.toBase58() && a !== mint.toBase58());
+      // The person launching pays this table's deposit and the site's small network fees for it, inside
+      // the same one approval, so the site wallet only lends the deposit for the few seconds before they
+      // approve. When the table is closed a few minutes later, the deposit comes back to the site wallet.
+      await refreshPrice(); // today's network fee price, so the repayment covers the site's fees
+      const setupLamports = await setupCost(own.length);
+      core[core.length - 1] = repay(user, setupLamports);
       let mine = null;
-      if (!dryRun) try { mine = await coinTable(own); } catch (e) {
+      if (!dryRun) try { mine = await coinTable(own, recordTable); } catch (e) {
         if (out(e)) throw budgetErr(e);
         console.error('coin lookup table: ' + (e && e.message));
-        const x = new Error(/insufficient|0x1\b|lamports/i.test(String(e && e.message)) ? 'The site wallet needs a little SOL before launches can start.' : 'The launch could not be prepared. Try again in a moment.');
+        const busy = /insufficient|0x1\b|lamports/i.test(String(e && e.message));
+        if (busy) console.error('SITE WALLET IS LOW: add a little SOL to ' + wallets.house.publicKey.toBase58());
+        const x = new Error(busy ? 'Lots of launches right now. Try again in a few seconds.' : 'The launch could not be prepared. Try again in a moment.');
         x.status = 503; x.expose = true; throw x;
       }
       await refreshPrice();
@@ -543,6 +565,7 @@ function createChain(config, opts = {}) {
           reserved: !!useReserved,
           table: table.key.toBase58(),
           coinTable: mine ? mine.key.toBase58() : null,
+          setupLamports,
           core: core.map(ixToJson)
         }
       };
@@ -669,6 +692,56 @@ function createChain(config, opts = {}) {
       return BigInt(t.state.deactivationSlot) === MAX ? 'off' : 'closed';
     },
 
+    // The same, for many launch tables at once: one read for all of them, and one small transaction per 20
+    // tables, so even thousands of launches get their deposits back within minutes.
+    // Returns { address: 'off' | 'closed' | 'wait' | 'gone' }.
+    async retireTables(addresses) {
+      const house = wallets.house, MAX = BigInt('18446744073709551615');
+      const result = {};
+      const keys = addresses.map(a => new PublicKey(a));
+      const infos = [];
+      for (let i = 0; i < keys.length; i += 100) infos.push(...await connection.getMultipleAccountsInfo(keys.slice(i, i + 100), 'confirmed'));
+      const slot = BigInt(await connection.getSlot('confirmed'));
+      const ixs = [];
+      keys.forEach((key, i) => {
+        const a = addresses[i], info = infos[i];
+        if (!info) { result[a] = 'gone'; return; }
+        let st;
+        try { st = AddressLookupTableAccount.deserialize(info.data); } catch (e) { result[a] = 'gone'; return; }
+        if (!st.authority || !st.authority.equals(house.publicKey)) { result[a] = 'gone'; return; }
+        if (BigInt(st.deactivationSlot) === MAX) {
+          ixs.push([a, 'off', AddressLookupTableProgram.deactivateLookupTable({ lookupTable: key, authority: house.publicKey })]);
+        } else if (slot > BigInt(st.deactivationSlot) + 520n) {
+          ixs.push([a, 'closed', AddressLookupTableProgram.closeLookupTable({ lookupTable: key, authority: house.publicKey, recipient: house.publicKey })]);
+        } else result[a] = 'wait';
+      });
+      for (let i = 0; i < ixs.length; i += 20) {
+        const group = ixs.slice(i, i + 20);
+        const tx = await freshTx(house.publicKey);
+        tx.add(...priorityIxs(3000 + 1500 * group.length), ...group.map(g => g[2]));
+        tx.sign(house);
+        try {
+          await sendAndConfirmRaw(tx.serialize(), { blockhash: tx.recentBlockhash, lastValidBlockHeight: tx.lastValidBlockHeight });
+          group.forEach(g => { result[g[0]] = g[1]; });
+        } catch (e) {
+          if (out(e)) { group.forEach(g => { if (!result[g[0]]) result[g[0]] = 'wait'; }); result.__out = true; return result; }
+          // One bad table shouldn't hold up the rest: try each on its own.
+          for (const g of group) {
+            try {
+              const one = await freshTx(house.publicKey);
+              one.add(...priorityIxs(4500), g[2]); one.sign(house);
+              await sendAndConfirmRaw(one.serialize(), { blockhash: one.recentBlockhash, lastValidBlockHeight: one.lastValidBlockHeight });
+              result[g[0]] = g[1];
+            } catch (e2) { if (out(e2)) { result.__out = true; result[g[0]] = 'wait'; return result; } result[g[0]] = 'wait'; }
+          }
+        }
+      }
+      return result;
+    },
+
+    // Enough SOL in a wallet for a launch? (checked before the site lends a launch its table deposit)
+    async walletLamports(address) { return connection.getBalance(new PublicKey(address), 'confirmed'); },
+
     async readSharingConfig(mint) {
       const { PUMP_SDK, feeSharingConfigPda } = pump();
       const info = await connection.getAccountInfo(feeSharingConfigPda(new PublicKey(mint)), 'confirmed');
@@ -708,13 +781,15 @@ function createChain(config, opts = {}) {
     },
 
     // Collect a coin's creator fees: pump.fun pays each share straight to its wallet.
-    // The house wallet pays the small network fee, out of its own cut.
+    // The house wallet pays the small network fee (covered many times over by what each launch pays it back).
     async distribute(mint) {
       const mintPk = new PublicKey(mint);
       const min = await onlineSdk().getMinimumDistributableFee(mintPk, wallets.house.publicKey);
       if (!min || !min.canDistribute) return null;
       const distributable = Number(min.distributableFees.toString());
-      if (distributable < config.minDistributeLamports) return null;
+      // Only collect when the fee is small next to what's collected (at most about 5% of the 30% share),
+      // so a busy network never makes collecting cost more than it's worth. Otherwise it waits and tries later.
+      if (distributable < Math.max(config.minDistributeLamports, feeLamports(1, 300000) * 67)) return null;
       const { instructions } = await onlineSdk().buildDistributeCreatorFeesInstructions(mintPk);
       const before = await connection.getBalance(wallets.pool.publicKey, 'confirmed');
       const tx = await freshTx(wallets.house.publicKey);
