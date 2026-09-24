@@ -27,6 +27,7 @@ function offlineChain(store, extra) {
   const ALT = 'AddressLookupTab1e1111111111111111111111111';
   c.getLatestBlockhash = async () => ({ blockhash: Keypair.generate().publicKey.toBase58(), lastValidBlockHeight: 1000 });
   c.getRecentPrioritizationFees = async () => [];
+  c.getMinimumBalanceForRentExemption = async (n) => (n + 128) * 6960; // Solana's deposit rule
   c.getBlockHeight = async () => 900;
   let slotN = 12345 + Math.floor(Math.random() * 1e6); c.getSlot = async () => ++slotN;
   c.getAddressLookupTable = async (key) => {
@@ -76,8 +77,8 @@ async function phantomSign(chain, b64, user, change) {
 const FEE_TO = Keypair.generate().publicKey.toBase58();
 const SPLIT = { poolBps: 7000, houseBps: 3000, feeTo: FEE_TO };
 const launch = (chain, user, devSol = 0.01) => chain.buildLaunchTx({
-  wallet: user.publicKey.toBase58(), name: 'Glass Owl', symbol: 'GLASS',
-  uri: 'https://ipfs.io/ipfs/bafkreiexmt4mwz27syozujt5tdizz6ibfeluelu7yejizsnzeefnvy7zqu', devBuyLamports: Math.round(devSol * 1e9), split: SPLIT
+  wallet: user.publicKey.toBase58(), name: 'Test Coin', symbol: 'TEST',
+  uri: 'https://example.com/test.json', devBuyLamports: Math.round(devSol * 1e9), split: SPLIT
 });
 const lighthouse = (user) => new TransactionInstruction({ programId: new PublicKey(LIGHTHOUSE_ID), keys: [{ pubkey: user.publicKey, isSigner: false, isWritable: false }], data: Buffer.alloc(40, 7) });
 
@@ -190,10 +191,9 @@ test('the nothing coin launches at its reserved address, its secret never leaves
   const tx = sent[0], bytes = tx.message.serialize(), nacl = require('tweetnacl');
   for (let i = 0; i < tx.message.header.numRequiredSignatures; i++) assert.ok(nacl.sign.detached.verify(bytes, tx.signatures[i], tx.message.staticAccountKeys[i].toBytes()));
   assert.ok(tx.message.staticAccountKeys.some(k => k.equals(reserved.publicKey)));
-  // the launching wallet is the creator (so it is not marked "Offchain"), and there is no setup payment any more
+  // the launching wallet is the creator (so it is not marked "Offchain")
   const tables = []; for (const l of tx.message.addressTableLookups) tables.push((await chain.connection.getAddressLookupTable(l.accountKey)).value);
   const ixs = TransactionMessage.decompile(tx.message, { addressLookupTableAccounts: tables }).instructions;
-  assert.ok(!ixs.some(ix => ix.programId.equals(SystemProgram.programId)), 'no setup payment');
   const create = ixs.find(ix => ix.programId.toBase58().startsWith('6EF8rrec'));
   assert.ok(Buffer.from(create.data).includes(user.publicKey.toBuffer()), 'the launching wallet is the creator');
   assert.ok(!Buffer.from(create.data).includes(creator.publicKey.toBuffer()), 'not a separate creator wallet');
@@ -224,7 +224,49 @@ test('every coin: the wallet that launches is the creator and makes the first bu
   assert.equal(data.readUInt16LE(data.indexOf(chain.wallets.pool.publicKey.toBuffer()) + 32), 7000, 'vault share is 70%');
   assert.equal(data.readUInt16LE(data.indexOf(new PublicKey(FEE_TO).toBuffer()) + 32), 3000, '30% wallet share is 30%');
   assert.ok(ixs.indexOf(fee[0]) > ixs.indexOf(buy), 'split is set after the coin exists');
-  assert.ok(!ixs.some(ix => ix.programId.equals(SystemProgram.programId)), 'no extra payment to the site');
+  // the only payment to the site: the launcher paying back this launch's own table (deposit + its small fees)
+  const pays = ixs.filter(ix => ix.programId.equals(SystemProgram.programId));
+  assert.equal(pays.length, 1, 'one setup repayment');
+  assert.ok(pays[0].keys[0].pubkey.equals(user.publicKey) && pays[0].keys[1].pubkey.equals(chain.wallets.house.publicKey), 'from the launcher to the site wallet');
+  const lamports = Number(Buffer.from(pays[0].data).readBigUInt64LE(4));
+  assert.equal(lamports, b.tx.setupLamports, 'exactly the setup cost');
+  assert.ok(lamports > 2_000_000 && lamports < 6_000_000, 'about 0.004 SOL, was ' + lamports);
+});
+
+test('launch tables are cleaned up in batches: switched off, then closed, deposits back to the site wallet', async () => {
+  const { chain } = offlineChain();
+  const c = chain.connection, house = chain.wallets.house.publicKey;
+  const MAX = BigInt('18446744073709551615');
+  const state = {}; // address -> deactivation slot
+  const addrs = Array.from({ length: 45 }, () => Keypair.generate().publicKey.toBase58());
+  addrs.forEach(a => { state[a] = MAX; });
+  let slot = 1000;
+  c.getSlot = async () => slot;
+  const encode = (deact) => { const b = Buffer.alloc(56); b.writeUInt32LE(1, 0); b.writeBigUInt64LE(deact, 4); b.writeUInt8(1, 21); house.toBuffer().copy(b, 22); return b; };
+  c.getMultipleAccountsInfo = async (keys) => keys.map(k => (state[k.toBase58()] === undefined ? null : { data: encode(state[k.toBase58()]) }));
+  const txs = [];
+  c.sendRawTransaction = async (raw) => {
+    const tx = Transaction.from(raw); txs.push(tx);
+    for (const ix of tx.instructions) {
+      if (ix.programId.toBase58() !== 'AddressLookupTab1e1111111111111111111111111') continue;
+      const kind = ix.data.readUInt32LE(0), a = ix.keys[0].pubkey.toBase58();
+      if (kind === 3) state[a] = BigInt(slot);
+      if (kind === 4) { assert.ok(ix.keys[2].pubkey.equals(house), 'deposit goes back to the site wallet'); delete state[a]; }
+    }
+    const sig = require('bs58').default.encode(tx.signature); seen.add(sig); return sig;
+  };
+  const seen = new Set();
+  c.getSignatureStatuses = async (list) => ({ value: list.map(sg => (seen.has(sg) ? { confirmationStatus: 'confirmed', err: null } : null)) });
+  const r1 = await chain.retireTables(addrs);
+  assert.ok(addrs.every(a => r1[a] === 'off'), 'all switched off');
+  assert.equal(txs.length, 3, '45 tables in 3 transactions');
+  const r2 = await chain.retireTables(addrs);
+  assert.ok(addrs.every(a => r2[a] === 'wait'), 'closing waits for Solana\'s cooldown');
+  slot += 600;
+  const r3 = await chain.retireTables(addrs);
+  assert.ok(addrs.every(a => r3[a] === 'closed'), 'all closed');
+  const r4 = await chain.retireTables(addrs);
+  assert.ok(addrs.every(a => r4[a] === 'gone'));
 });
 
 
